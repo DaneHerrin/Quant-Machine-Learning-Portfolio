@@ -1,0 +1,314 @@
+---
+title: "2 Year backtesting dividen portfolio"
+subtitle: "Using TidyFinance to construct a dividend portfolio and Carhart factor"
+author: "Dane Herrin"
+date: last-modified
+format:
+    html:
+        toc: true
+        theme: darkly
+    pdf:
+        toc: true
+        number-sections: true
+echo: true
+warning: false
+jupyter: python3
+---
+
+# Portfolio Construction Using TidyFinance
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import yfinance as yf
+import statsmodels.api as sm
+import tidyfinance as tf
+import polars as pl
+
+tf.set_backend("polars")
+```
+## Portfolio Construction
+    - Should be a slightly defensive strategy, but foregoing securities
+    - Pure equity, index funds, and REITS no bonds or other asset classes
+
+
+```{python}
+prices = tf.download_data(
+    domain="Stock Prices",
+    symbols=["ET", "MO", "ARCC", "NLY", "AGNC", "VZ", "BCE", "BTI", "D", "EIX", "MCD", "QQQ", "SPY"],
+    start_date="2024-09-14",
+    end_date="2026-09-14",
+).to_pandas()
+
+print(prices.columns.tolist())
+print(prices.head())
+```
+
+```{python}
+prices = prices.sort_values(['symbol', 'date'])
+
+prices['price_return'] = prices.groupby('symbol')['close'].pct_change()
+prices['total_return'] = prices.groupby('symbol')['adjusted_close'].pct_change()
+prices['dividend_contribution'] = prices['total_return'] - prices['price_return']
+
+print(prices.head())
+
+returns_wide = prices.pivot(index='date', columns='symbol', values='total_return')
+```
+
+```{python}
+agnc = prices[prices['symbol'] == 'AGNC'].copy()
+agnc['div_flag'] = agnc['dividend_contribution'].abs() > 0.001
+
+agnc[agnc['div_flag']][['date', 'close', 'adjusted_close', 'price_return', 'total_return', 'dividend_contribution']]
+```
+
+
+```{python}
+div_events = prices[prices['dividend_contribution'].abs() > 0.001].copy()
+div_events.groupby('symbol')['date'].count()
+#print(div_events.head())
+```
+
+
+```{python}
+weights = {
+    'SPY': 0.20,
+    'QQQ': 0.20,
+    'AGNC': 0.40 / 6,
+    'NLY': 0.40 / 6,
+    'ARCC': 0.40 / 6,
+    'ET': 0.40 / 6,
+    'MO': 0.40 / 6,
+    'BTI': 0.40 / 6,
+    'VZ': 0.20 / 5,
+    'BCE': 0.20 / 5,
+    'EIX': 0.20 / 5,
+    'D': 0.20 / 5,
+    'MCD': 0.20 / 5,
+}
+
+assert abs(sum(weights.values()) - 1.0) < 1e-9
+weight_series = pd.Series(weights)
+```
+
+
+```{python}
+returns_wide = prices.pivot(index='date', columns='symbol', values='total_return')
+
+# check for missing data before trusting a weighted sum
+missing_by_date = returns_wide[weight_series.index].isna().sum(axis=1)
+
+print(missing_by_date[missing_by_date > 0])
+```
+
+```{python}
+returns_wide = returns_wide.iloc[1:]
+
+fund_return = returns_wide[weight_series.index].mul(weight_series, axis=1).sum(axis=1, min_count=len(weight_series))
+print(fund_return.isna().sum())
+```
+
+```{python}
+print(fund_return.head())
+```
+## Fama-French 5 Factor Model
+```{python}
+
+ff5 = tf.download_data(
+    domain="Fama-French",
+    dataset="Fama/French 5 Factors (2x3) [Daily]",
+    start_date="2024-09-14",
+    end_date="2026-09-14",
+).to_pandas()
+
+print(ff5.columns.tolist())
+```
+
+
+```{python}
+merged = pd.DataFrame({'fund_return': fund_return}).reset_index()
+merged = merged.merge(ff5, on="date", how="inner")
+
+print(merged[['mkt_excess', 'risk_free']].describe())
+print(merged['fund_return'].describe())
+```
+
+
+```{python}
+merged['fund_excess'] = merged['fund_return'] - merged['risk_free']
+
+import statsmodels.api as sm
+
+X = sm.add_constant(merged[['mkt_excess', 'smb', 'hml', 'rmw', 'cma']])
+y = merged['fund_excess']
+
+model = sm.OLS(y, X).fit()
+print(model.summary())
+```
+
+```{python}
+model_robust = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 5})
+print(model_robust.summary())
+```
+
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+plt.style.use('dark_background')
+
+cum_fund = (1 + fund_return).cumprod()
+cum_spy = (1 + returns_wide['SPY']).cumprod().reindex(cum_fund.index)
+cum_qqq = (1 + returns_wide['QQQ']).cumprod().reindex(cum_fund.index)
+
+fig, ax = plt.subplots(figsize=(12, 6), facecolor='#0d1117')
+ax.set_facecolor('#0d1117')
+
+ax.plot(cum_fund.index, cum_fund, color='#00d4ff', linewidth=2.2, label='Anchored Dividend Fund')
+ax.plot(cum_spy.index, cum_spy, color='#ff6b6b', linewidth=1.6, linestyle='--', label='SPY')
+ax.plot(cum_qqq.index, cum_qqq, color='#ffd93d', linewidth=1.6, linestyle='--', label='QQQ')
+
+ax.set_title('Cumulative Total Return: Fund vs. Benchmarks', fontsize=15, fontweight='bold', color='white')
+ax.set_ylabel('Growth of $1', color='white')
+ax.legend(frameon=False, fontsize=11)
+ax.grid(alpha=0.15)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+for spine in ax.spines.values():
+    spine.set_color('#333333')
+
+plt.tight_layout()
+plt.savefig('fund_cumulative_return.png', dpi=200, facecolor=fig.get_facecolor())
+plt.show()
+```
+
+```{python}
+factors = ['mkt_excess', 'smb', 'hml', 'rmw', 'cma']
+coefs = model.params[factors]
+conf = model.conf_int().loc[factors]
+errors = [coefs - conf[0], conf[1] - coefs]
+colors = ['#00d4ff' if p < 0.05 else '#555555' for p in model.pvalues[factors]]
+
+fig, ax = plt.subplots(figsize=(9, 6), facecolor='#0d1117')
+ax.set_facecolor('#0d1117')
+
+ax.bar(factors, coefs, yerr=errors, color=colors, edgecolor='white', linewidth=0.6, capsize=6)
+ax.axhline(0, color='white', linewidth=0.8)
+ax.set_title('Five-Factor Loadings (95% CI, HAC)', fontsize=15, fontweight='bold', color='white')
+ax.set_ylabel('Coefficient', color='white')
+ax.grid(axis='y', alpha=0.15)
+for spine in ax.spines.values():
+    spine.set_color('#333333')
+
+plt.tight_layout()
+plt.savefig('factor_loadings.png', dpi=200, facecolor=fig.get_facecolor())
+plt.show()
+```
+
+
+```{python}
+window = 90
+m = merged.set_index('date')
+roll_beta = m['fund_excess'].rolling(window).cov(m['mkt_excess']) / m['mkt_excess'].rolling(window).var()
+
+fig, ax = plt.subplots(figsize=(12, 6), facecolor='#0d1117')
+ax.set_facecolor('#0d1117')
+
+ax.plot(roll_beta.index, roll_beta, color='#00d4ff', linewidth=1.8)
+ax.axhline(model.params['mkt_excess'], color='#ff6b6b', linestyle='--', linewidth=1.4,
+           label=f"Full-sample beta ({model.params['mkt_excess']:.2f})")
+ax.axhline(1.0, color='#888888', linestyle=':', linewidth=1, label='Market (beta = 1.0)')
+
+ax.set_title(f'Rolling {window}-Day Beta to Market', fontsize=15, fontweight='bold', color='white')
+ax.set_ylabel('Beta', color='white')
+ax.legend(frameon=False, fontsize=10)
+ax.grid(alpha=0.15)
+for spine in ax.spines.values():
+    spine.set_color('#333333')
+
+plt.tight_layout()
+plt.savefig('rolling_beta.png', dpi=200, facecolor=fig.get_facecolor())
+plt.show()
+```
+
+
+```{python}
+price_return_wide = prices.pivot(index='date', columns='symbol', values='price_return').iloc[1:]
+div_contrib_wide = prices.pivot(index='date', columns='symbol', values='dividend_contribution').iloc[1:]
+
+fund_price_return = price_return_wide[weight_series.index].mul(weight_series, axis=1).sum(axis=1, min_count=len(weight_series))
+fund_div_contribution = div_contrib_wide[weight_series.index].mul(weight_series, axis=1).sum(axis=1, min_count=len(weight_series))
+
+cum_price = (1 + fund_price_return).cumprod() - 1
+cum_total = (1 + fund_return).cumprod() - 1
+cum_dividend = cum_total - cum_price
+
+fig, ax = plt.subplots(figsize=(12, 6), facecolor='#0d1117')
+ax.set_facecolor('#0d1117')
+
+ax.stackplot(cum_price.index, cum_price.clip(lower=0), cum_dividend.clip(lower=0),
+             colors=['#00d4ff', '#ffd93d'], labels=['Price return', 'Dividend contribution'], alpha=0.85)
+ax.plot(cum_total.index, cum_total, color='white', linewidth=1.5, linestyle='--', label='Total return')
+
+ax.set_title('Fund Return Decomposition: Price vs. Dividend Contribution', fontsize=15, fontweight='bold', color='white')
+ax.set_ylabel('Cumulative Return', color='white')
+ax.legend(frameon=False, fontsize=10, loc='upper left')
+ax.grid(alpha=0.15)
+for spine in ax.spines.values():
+    spine.set_color('#333333')
+
+plt.tight_layout()
+plt.savefig('dividend_decomposition.png', dpi=200, facecolor=fig.get_facecolor())
+plt.show()
+```
+
+
+```{python}
+ann_return = returns_wide.mean() * 252
+ann_vol = returns_wide.std() * (252 ** 0.5)
+
+tier_map = {}
+for sym in weight_series.index:
+    if sym in ['SPY', 'QQQ']:
+        tier_map[sym] = 'Anchor'
+    elif sym in ['AGNC', 'NLY', 'ARCC', 'ET', 'MO', 'BTI']:
+        tier_map[sym] = 'Higher Dividend'
+    else:
+        tier_map[sym] = 'Lower Dividend'
+
+color_map = {'Anchor': '#ff6b6b', 'Higher Dividend': '#00d4ff', 'Lower Dividend': '#ffd93d'}
+
+fig, ax = plt.subplots(figsize=(10, 7), facecolor='#0d1117')
+ax.set_facecolor('#0d1117')
+
+for sym in weight_series.index:
+    ax.scatter(ann_vol[sym], ann_return[sym], s=weight_series[sym] * 3000,
+               color=color_map[tier_map[sym]], edgecolor='white', linewidth=0.6, alpha=0.85)
+    ax.annotate(sym, (ann_vol[sym], ann_return[sym]), color='white', fontsize=9,
+                xytext=(5, 5), textcoords='offset points')
+
+fund_ann_return = fund_return.mean() * 252
+fund_ann_vol = fund_return.std() * (252 ** 0.5)
+ax.scatter(fund_ann_vol, fund_ann_return, s=400, color='white', marker='*',
+           edgecolor='black', linewidth=1, zorder=5)
+
+handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markersize=10, label=t)
+           for t, c in color_map.items()]
+handles.append(plt.Line2D([0], [0], marker='*', color='w', markerfacecolor='white',
+                           markersize=15, label='Fund (blended)'))
+ax.legend(handles=handles, frameon=False, fontsize=10, loc='upper left')
+
+ax.set_title('Risk vs. Return by Holding and Tier', fontsize=15, fontweight='bold', color='white')
+ax.set_xlabel('Annualized Volatility', color='white')
+ax.set_ylabel('Annualized Return', color='white')
+ax.grid(alpha=0.15)
+for spine in ax.spines.values():
+    spine.set_color('#333333')
+
+plt.tight_layout()
+plt.savefig('risk_return_scatter.png', dpi=200, facecolor=fig.get_facecolor())
+plt.show()
+```
